@@ -1,0 +1,254 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Feb 19 09:46:50 2026
+
+@author: manip_F112
+"""
+
+#import requests
+import urllib.request
+import numpy as np
+import requests
+import sys
+
+import qcodes as qc
+from qcodes.logger.logger import start_all_logging
+from qcodes.dataset.plotting import plot_dataset,plot_by_id
+from qcodes.instrument.specialized_parameters import ElapsedTimeParameter
+#from qcodes.loops import Loop
+#from qcodes.plots.pyqtgraph import QtPlot
+import numpy as np
+import datetime
+import time
+import matplotlib.pyplot as plt
+from time import sleep
+import json
+import os
+
+############### Virtual drivers #################
+
+sys.path.append('C:\\Users\\manip_F112\\Documents\\Experiment_16T\\qcodes_drivers')
+
+from qcodes.instrument_drivers.stanford_research.SR860 import SR860
+
+lockin_B = SR860('Lockin', 'USB0::0xB506::0x2000::006247::INSTR')   #
+
+from qcodes.instrument_drivers.stanford_research import SR830
+
+lockin_A = SR830("lockin_a", "ASRL3::INSTR",terminator="\r")
+
+lockin_C = SR830("lockin_c", "ASRL8::INSTR",terminator="\r")
+
+#from qcodes.instrument_drivers.yokogawa.GS200 import GS200
+
+import DAC20_qcodes
+
+import Myserial_qcodes
+
+from DAC20_qcodes import Dac
+
+from Myserial_qcodes import MySerialPort
+
+#dac=Dac(port='COM7')
+
+dac=Dac(port='COM15')
+
+#chan1 is backgate     chan2 is top gate
+islowaxis=2
+ifastaxis=1
+
+tophBN=67e-9
+bothBN=75e-9
+
+#rbn=tophBN/bothBN  # if top gate fast axis
+
+rbn=bothBN/tophBN  # if bottom gate fast axis
+
+V0t=0.0
+V0b=0.0
+#lockin_B.sine_outdc(0.0)
+
+#0.17s per point + tsl
+tsl=0.02  #time sleep each point
+trc=0.01
+twait=10*(tsl+trc) #time sleep each loop
+
+Vmin=-2.5
+Vmax=2.5
+Vnstep=45
+Vg=np.linspace(Vmin,Vmax,Vnstep)   # slow AXIS
+
+dV=3.5
+Vdnstep=3000
+
+Vdmin=-(Vmin+V0t)*rbn-V0b-dV
+Vdmax=-(Vmax+V0t)*rbn-V0b+dV
+Vdc=np.linspace(Vdmin,Vdmax,Vdnstep)   #   FAST AXIS   ONLY works with bottom gate as fast axis
+
+
+###############################################################################
+#
+#                      INITIALIZE QCODES EXPERIMENT
+#
+###############################################################################
+
+start_all_logging()
+
+# Create a station
+station = qc.Station()
+# station.add_component(lockin_C)
+station.add_component(lockin_B)
+# station.add_component(lockin)
+# station.add_component(lockin_thermometre)
+
+station.snapshot()
+station.components
+
+# Experiment details
+user='AA'
+sample_name='FB5'
+date=datetime.datetime.today().strftime('%Y_%m_%d')
+description=sample_name
+database_name = date+"_"+user+"_"+description
+print(database_name)
+
+exp_name     = sample_name
+sample_name  = sample_name
+
+###############################################################################
+#                           DATA FOLDER CREATION
+###############################################################################
+
+script_dir=os.path.dirname(__file__)
+data_dir=os.path.join(r'C:\\Users\\manip_F112\\Documents\\Experiment_16T\\Data\\FB5')
+
+try :
+	os.mkdir(data_dir)
+except FileExistsError:
+	pass
+
+data_dir=data_dir +'\\'+description
+
+try :
+	os.mkdir(data_dir)
+except FileExistsError:
+	pass
+
+###############################################################################
+#                       CREATE OR INITIALIZE DATABASE
+################################################################################
+
+qc.initialise_or_create_database_at(data_dir+'\\'+database_name+'.db')
+qc.config.core.db_location
+
+
+exp=qc.load_or_create_experiment(experiment_name=exp_name,
+									  sample_name=sample_name)
+
+meas = qc.Measurement(exp=exp, station=station)
+#meas.register_parameter(VNA.channels.S21.power)
+
+# meas.register_parameter(lockin_thermometre.R)
+
+meas.register_custom_parameter('Time', unit='s')
+meas.register_custom_parameter('Vdc', unit='V')
+meas.register_custom_parameter('Vg', unit='V')
+
+meas.register_custom_parameter('lockin_B_X', setpoints=['Vdc', 'Vg'])
+meas.register_custom_parameter('lockin_B_Y', setpoints=['Vdc', 'Vg'])
+
+meas.register_custom_parameter('lockin_A_X', setpoints=['Vdc', 'Vg'])
+meas.register_custom_parameter('lockin_A_Y', setpoints=['Vdc', 'Vg'])
+
+meas.register_custom_parameter('lockin_C_X', setpoints=['Vdc', 'Vg'])
+meas.register_custom_parameter('lockin_C_Y', setpoints=['Vdc', 'Vg'])
+
+meas.register_custom_parameter('Rxy_X', setpoints=['Vdc', 'Vg'])
+Vgain=100
+Igain=1e7
+
+
+############################## Measurement ##################################
+
+
+time_start = time.time()
+
+parameter_snap={}
+
+print(f'database name : {database_name}')
+
+#yoko2.ramp_voltage(Vdc[0], 0.2, 0.01)
+dac.StartSweep(channel=islowaxis, target=int(Vg[0] * 52428.8), r=100000)
+dac.StartSweep(channel=ifastaxis, target=int(Vdc[0] * 52428.8), r=100000)
+
+if np.abs(Vg[0])<np.abs(Vdc[0]) or np.abs(Vg[0])==np.abs(Vdc[0]):
+	time.sleep(np.abs(Vdc[0])/0.1)
+
+if np.abs(Vg[0])>np.abs(Vdc[0]):
+	time.sleep(np.abs(Vg[0])/0.1)
+
+with meas.run() as datasaver:
+
+	id=datasaver.dataset.run_id
+
+	qc.load_by_run_spec( captured_run_id=id).add_metadata('parameter_snap',
+						 json.dumps(parameter_snap))
+
+	time0 = time.time()
+	current_time = time.time() - time0
+
+	for i, valg in enumerate(Vg) :
+
+		#yoko2.ramp_voltage(Vdc[0], 0.2, 0.01)
+		dac.StartSweep(channel=islowaxis, target=int(valg * 52428.8), r=100000)
+
+		Vdmin = -(valg + V0t) * rbn - V0b - dV
+		Vdmax = -(valg + V0t) * rbn - V0b + dV
+		Vdc = np.linspace(Vdmin, Vdmax, Vdnstep)  # this if for   FAST AXIS
+
+
+		dac.StartSweep(channel=ifastaxis, target=int(Vdc[0] * 52428.8), r=100000)
+
+		time.sleep(np.abs(Vdc[-1]-Vdc[0])/0.1)
+
+		if i==0:
+			time.sleep(5.0)
+
+		time.sleep(twait)
+
+		for j, valdc in enumerate(Vdc) :
+
+			dac.ChangeVout(channel=ifastaxis, vb=int(valdc * 52428.8))
+			#yoko2.ramp_voltage(valdc, 0.2, 0.01)
+
+			time.sleep(tsl+trc)
+
+			#V_X2_B = lockin_B.X()  # voltage X
+			#V_Y2_B = lockin_B.Y()  # voltage Y
+			V_X2_A, V_Y2_A = lockin_A.snap("X","Y")  #
+			V_X2_B, V_Y2_B = lockin_B.get_values("X","Y")  # 
+			V_X2_C, V_Y2_C = lockin_C.snap("X","Y")  #
+
+			cons_current=200e-3/11/1e7
+			Rxy_p=V_X2_C/Vgain/cons_current
+
+			current_time = time.time() - time0  # elapsed time
+			datasaver.add_result(('lockin_B_X', V_X2_B),
+								 ('lockin_B_Y', V_Y2_B),
+								 ('lockin_A_X', V_X2_A),
+								 ('lockin_A_Y', V_Y2_A),
+								 ('lockin_C_X', V_X2_C),
+								 ('lockin_C_Y', V_Y2_C),
+								 ('Rxy_X', Rxy_p),
+								 ('Vdc', valdc),
+								 ('Vg', valg),
+								 ('Time', current_time))
+
+current_time = time.time() 
+
+print ('time measurement:', current_time-time_start, 's')
+
+#yoko2.ramp_voltage(0.0, 0.2, 0.01)
+
+dac.StartSweep(channel=islowaxis, target=int(0.0 * 52428.8), r=100000)
+dac.StartSweep(channel=ifastaxis, target=int(0.0 * 52428.8), r=100000)
