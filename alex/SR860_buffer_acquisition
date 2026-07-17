@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 from time import sleep
 import json
 import os
+from scipy.optimize import curve_fit
 sys.path.append('C:\\Users\\diluette\\Documents\\AlexA\\drivers')
 
 import pyvisa
@@ -167,6 +168,74 @@ print(f'Buffer sized for {max_expected_samples} samples '
 t_skip = 2 * tclockin   # settle time after each gate step before trusting the lock-in output
 
 
+def calibrate_capture_offset(buf, gate_source, calib_voltages, settle_time):
+	"""
+	Determine the fixed offset between a PC-issued voltage-set command
+	(timestamped with time.perf_counter()) and the corresponding sample
+	index in the SR860 capture buffer.
+
+	calib_voltages : sequence of voltages to step through. Should span a
+	                  large enough range to give a clearly resolvable step
+	                  in X, but must stay within safe/expected gate limits.
+	settle_time     : wait time after each step (s). Must be >> tclockin
+	                  (e.g. 15-20 * tclockin) so each step fully settles
+	                  before the next one -- this isolates each transient.
+	"""
+	buf.start_capture("CONT", "IMM")
+	t_start = time.perf_counter()
+
+	step_timestamps = np.zeros(len(calib_voltages))
+
+	for k, v in enumerate(calib_voltages):
+		gate_source.ramp_voltage(v, 100, 0.01)
+		step_timestamps[k] = time.perf_counter()
+		time.sleep(settle_time)
+
+	buf.stop_capture()
+
+	actual_bytes   = buf.count_capture_bytes()
+	actual_samples = actual_bytes // (2 * buf.bytes_per_sample)
+	data   = buf.get_capture_data(actual_samples)
+	X_buf  = data["X"]
+	sample_times = t_start + np.arange(len(X_buf)) / buf.capture_rate()
+
+	def step_model(t, t0, tau, A, B):
+		return np.where(t < t0, A, A + B * (1 - np.exp(-(t - t0) / tau)))
+
+	offsets = []
+
+	for k in range(1, len(calib_voltages)):   # skip k=0, no defined baseline before it
+		t_cmd = step_timestamps[k]
+		t_lo  = t_cmd - settle_time * 0.5
+		t_hi  = t_cmd + settle_time * 0.9
+		mask  = (sample_times >= t_lo) & (sample_times < t_hi)
+		t_win = sample_times[mask]
+		y_win = X_buf[mask]
+
+		if len(t_win) < 10:
+			continue
+
+		p0 = [t_cmd, tclockin, y_win[0], y_win[-1] - y_win[0]]
+
+		try:
+			popt, _ = curve_fit(step_model, t_win, y_win, p0=p0, maxfev=5000)
+			offsets.append(popt[0] - t_cmd)
+		except RuntimeError:
+			continue
+
+	if len(offsets) == 0:
+		raise RuntimeError("Capture offset calibration failed: no step could be fit")
+
+	offsets = np.array(offsets)
+	good = np.abs(offsets - np.median(offsets)) < 2 * np.std(offsets) + 1e-9
+	t_offset = offsets[good].mean()
+
+	print(f'Calibration step offsets (ms): {offsets*1e3}')
+	print(f'--> using t_offset = {t_offset*1e3:.2f} ms (from {good.sum()}/{len(offsets)} steps)')
+
+	return t_offset
+
+
 ############################## Measurement ##################################
 
 
@@ -178,6 +247,14 @@ print(f'database name : {database_name}')
 
 yoko.ramp_voltage( Vg[0], 0.2, 0.01)
 yoko2.ramp_voltage( Vdc[0], 0.2, 0.01)
+
+# ---- one-time calibration of the fixed capture-start offset ----
+calib_indices  = np.linspace(0, Vdnstep - 1, 5).astype(int)   # 5 points spread across the sweep range
+calib_voltages = Vdc[calib_indices]
+t_offset = calibrate_capture_offset(buf, yoko2, calib_voltages, settle_time=20 * tclockin)
+
+# return the gate to the actual sweep start after calibration
+yoko2.ramp_voltage( Vdc[0], 100, 0.01)
 
 with meas.run() as datasaver:
 
@@ -227,19 +304,21 @@ with meas.run() as datasaver:
 		sample_times = t_start + np.arange(len(X_buf)) / buf.capture_rate()
 
 		# ---- bin buffer samples onto each gate step ----
+		corrected_timestamps = timestamps + t_offset
+
 		X_binned = np.full(Vdnstep, np.nan)
 		Y_binned = np.full(Vdnstep, np.nan)
 
 		for j in range(Vdnstep):
-			t0 = timestamps[j] + t_skip
-			t1 = timestamps[j + 1] if j + 1 < Vdnstep else t_end
+			t0 = corrected_timestamps[j] + t_skip
+			t1 = corrected_timestamps[j + 1] if j + 1 < Vdnstep else t_end
 			mask = (sample_times >= t0) & (sample_times < t1)
 			if mask.any():
 				X_binned[j] = X_buf[mask].mean()
 				Y_binned[j] = Y_buf[mask].mean()
 			else:
 				# fallback if the window was too short to contain a sample
-				idx = np.argmin(np.abs(sample_times - timestamps[j]))
+				idx = np.argmin(np.abs(sample_times - corrected_timestamps[j]))
 				X_binned[j] = X_buf[idx]
 				Y_binned[j] = Y_buf[idx]
 
