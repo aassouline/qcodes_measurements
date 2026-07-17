@@ -1,0 +1,264 @@
+#import requests
+import urllib.request
+import numpy as np
+import requests
+import sys
+
+import qcodes as qc
+from qcodes.logger.logger import start_all_logging
+from qcodes.dataset.plotting import plot_dataset,plot_by_id
+from qcodes.instrument.specialized_parameters import ElapsedTimeParameter
+#from qcodes.loops import Loop
+#from qcodes.plots.pyqtgraph import QtPlot
+import numpy as np
+import datetime
+import time
+import matplotlib.pyplot as plt
+from time import sleep
+import json
+import os
+sys.path.append('C:\\Users\\diluette\\Documents\\AlexA\\drivers')
+
+import pyvisa
+
+############### Virtual drivers #################
+
+sys.path.append('C:\\Users\\diluette\\Documents\\AlexA\\drivers\\StanfordResearchSystems')
+from SR860 import SR860
+lockin_B = SR860('Lockin', 'GPIB0::5::INSTR')
+lockin_B.amplitude(0.0005)   #V
+
+tclockin=0.1
+lockin_B.time_constant(tclockin)  #s
+lockin_B.sensitivity(0.2)   #V
+lockin_B.frequency(85.0)  # Hz
+
+sys.path.append('C:\\Users\\diluette\\Documents\\AlexA\\drivers\\RohdeSchwarz')
+from SMB100A_JW import RS_SMB100A
+RFsource= RS_SMB100A('RFsource', 'GPIB0::19::INSTR')
+RFsource.frequency(3.637e9)
+#RFsource.frequency(1.0e9)
+
+RFsource.power(-20.0)
+RFsource.off()
+
+from GS200 import GS200
+yoko = GS200('yoko', 'GPIB0::2::INSTR')   # source   ADRESS GPIB  Top gate
+yoko2 = GS200('yoko2', 'GPIB0::4::INSTR')   # source   ADRESS GPIB   Bottom gate
+
+#yoko3 = GS200('yoko3', 'GPIB0::1::INSTR')   # source   ADRESS GPIB
+#yoko3.ramp_voltage(0.0, 0.2, 0.01)
+
+tophBN=50e-9
+bothBN=32e-9
+V0t=2.04
+V0b=-1.3
+
+#0.1s per point + tsl
+tsl=tclockin  #time sleep each point
+twait=10*tsl #time sleep each loop
+
+Vmin=-15.0
+Vmax=20.0
+Vmax=36.0
+
+Vnstep=21  #201x701  9h
+Vg=np.linspace(Vmin,Vmax,Vnstep)   #yoko  Top gate   SLOW AXIS
+
+dV=5.0
+Vdnstep=701
+#Vdnstep=401  #75
+
+Vdmin=-(Vmin+V0t)*bothBN/tophBN-V0b-dV
+Vdmax=-(Vmax+V0t)*bothBN/tophBN-V0b+dV
+Vdc=np.linspace(Vdmin,Vdmax,Vdnstep)   #yoko2  Bottom gate   FAST AXIS
+
+###############################################################################
+#
+#                      INITIALIZE QCODES EXPERIMENT
+#
+###############################################################################
+
+start_all_logging()
+
+# Create a station
+station = qc.Station()
+# station.add_component(lockin_C)
+station.add_component(lockin_B)
+# station.add_component(lockin)
+# station.add_component(lockin_thermometre)
+
+station.snapshot()
+station.components
+
+# Experiment details
+user='AA'
+date=datetime.datetime.today().strftime('%Y_%m_%d')
+description='Resistance_vs_Vtop_Vbot'
+database_name = date+"_"+user+"_"+description
+print(database_name)
+
+exp_name     = 'Resistance vs Vtop and Vbot'
+sample_name  = 'MM3'
+
+###############################################################################
+#                           DATA FOLDER CREATION
+###############################################################################
+
+script_dir=os.path.dirname(__file__)
+data_dir=os.path.join(r'C:\\Users\\diluette\\Documents\\AlexA\\data\\MM3\\Cooldown2\\R_vs_Vgate')
+
+try :
+	os.mkdir(data_dir)
+except FileExistsError:
+	pass
+
+data_dir=data_dir +'\\'+description
+
+try :
+	os.mkdir(data_dir)
+except FileExistsError:
+	pass
+
+###############################################################################
+#                       CREATE OR INITIALIZE DATABASE
+################################################################################
+
+qc.initialise_or_create_database_at(data_dir+'\\'+database_name+'.db')
+qc.config.core.db_location
+
+
+exp=qc.load_or_create_experiment(experiment_name=exp_name,
+									  sample_name=sample_name)
+
+meas = qc.Measurement(exp=exp, station=station)
+#meas.register_parameter(VNA.channels.S21.power)
+
+# meas.register_parameter(lockin_thermometre.R)
+
+meas.register_custom_parameter('Time', unit='s')
+meas.register_custom_parameter('Vbot', unit='V')
+meas.register_custom_parameter('Vtop', unit='V')
+
+meas.register_parameter(lockin_B.X, setpoints=['Vbot', 'Vtop'])
+meas.register_parameter(lockin_B.Y, setpoints=['Vbot', 'Vtop'])
+
+
+###############################################################################
+#                    LOCK-IN BUFFER SETUP (fast axis readout)
+###############################################################################
+
+buf = lockin_B.buffer
+buf.capture_config("X,Y")
+
+n_oversample = 10                       # samples captured per gate step (tune as needed)
+target_rate  = n_oversample / tsl       # desired capture rate [Hz]
+buf.capture_rate(target_rate)           # rounds to nearest valid rate (max_rate / 2^n)
+print(f'SR860 buffer capture rate: {buf.capture_rate():.3f} Hz '
+	  f'(requested {target_rate:.3f} Hz)')
+
+# Size the buffer generously for one full j-sweep, with margin for VISA/ramp overhead
+_margin = 2.0
+max_expected_samples = int(np.ceil(buf.capture_rate() * Vdnstep * tsl * _margin))
+buf.set_capture_length_to_fit_samples(max_expected_samples)
+print(f'Buffer sized for {max_expected_samples} samples '
+	  f'({buf.capture_length_in_kb()} kB)')
+
+t_skip = 2 * tclockin   # settle time after each gate step before trusting the lock-in output
+
+
+############################## Measurement ##################################
+
+
+time_start = time.time()
+
+parameter_snap={}
+
+print(f'database name : {database_name}')
+
+yoko.ramp_voltage( Vg[0], 0.2, 0.01)
+yoko2.ramp_voltage( Vdc[0], 0.2, 0.01)
+
+with meas.run() as datasaver:
+
+	id=datasaver.dataset.run_id
+
+	qc.load_by_run_spec( captured_run_id=id).add_metadata('parameter_snap',
+						 json.dumps(parameter_snap))
+
+	time0 = time.time()
+	current_time = time.time() - time0
+
+	for i, valg in enumerate(Vg) :
+
+		yoko.ramp_voltage( valg, 100, 0.01)
+
+		Vdmin = -(valg + V0t) * bothBN / tophBN - V0b - dV
+		Vdmax = -(valg + V0t) * bothBN / tophBN - V0b + dV
+		Vdc = np.linspace(Vdmin, Vdmax, Vdnstep)  # yoko2  Bottom gate   FAST AXIS
+
+		yoko2.ramp_voltage( Vdc[0], 100, 0.01)
+
+		if i==0:
+			time.sleep(5.0)
+
+		time.sleep(twait)
+
+		# ---- start buffered capture for this whole j-sweep ----
+		buf.start_capture("CONT", "IMM")
+		t_start = time.perf_counter()
+
+		timestamps = np.zeros(Vdnstep)
+
+		for j, valdc in enumerate(Vdc):
+
+			yoko2.ramp_voltage( valdc, 100, 0.01)
+			timestamps[j] = time.perf_counter()
+			time.sleep(tsl)
+
+		t_end = time.perf_counter()
+		buf.stop_capture()
+
+		# ---- retrieve the whole line in one shot ----
+		actual_bytes   = buf.count_capture_bytes()
+		actual_samples = actual_bytes // (2 * buf.bytes_per_sample)   # 2 channels: X, Y
+		data   = buf.get_capture_data(actual_samples)
+		X_buf, Y_buf = data["X"], data["Y"]
+		sample_times = t_start + np.arange(len(X_buf)) / buf.capture_rate()
+
+		# ---- bin buffer samples onto each gate step ----
+		X_binned = np.full(Vdnstep, np.nan)
+		Y_binned = np.full(Vdnstep, np.nan)
+
+		for j in range(Vdnstep):
+			t0 = timestamps[j] + t_skip
+			t1 = timestamps[j + 1] if j + 1 < Vdnstep else t_end
+			mask = (sample_times >= t0) & (sample_times < t1)
+			if mask.any():
+				X_binned[j] = X_buf[mask].mean()
+				Y_binned[j] = Y_buf[mask].mean()
+			else:
+				# fallback if the window was too short to contain a sample
+				idx = np.argmin(np.abs(sample_times - timestamps[j]))
+				X_binned[j] = X_buf[idx]
+				Y_binned[j] = Y_buf[idx]
+
+		# ---- push the line into the dataset ----
+		for j, valdc in enumerate(Vdc):
+
+			current_time = timestamps[j] - time0
+
+			datasaver.add_result((lockin_B.X, X_binned[j]),
+								  (lockin_B.Y, Y_binned[j]),
+								  ('Vbot', valdc),
+								  ('Vtop', valg),
+								  ('Time', current_time))
+
+current_time = time.time() 
+
+print ('time measurement:', current_time-time_start, 's')
+yoko.ramp_voltage( 0.0, 0.2, 0.01)
+yoko2.ramp_voltage( 0.0, 0.2, 0.01)
+
+RFsource.power(-20.0)
+RFsource.off()
