@@ -46,7 +46,7 @@ GS200_ADDRESS = 'USB0::0x0B21::0x0039::901C17645::INSTR'
 
 # ---- lock-in settings ----
 VAMP = 0.1          # V, lock-in excitation amplitude
-TCLOCKIN = 0.003    # s, lock-in time constant
+TCLOCKIN = 1e-3    # s, lock-in time constant
 SENSITIVITY = 0.05  # V, lock-in sensitivity
 FREQUENCY = 1.33e3  # Hz, lock-in reference frequency
 
@@ -57,13 +57,13 @@ DAC_RAMP_SLOPE = 0.01   # V/ms
 GS200_VOLTAGE_RANGE = 10.0   # V, safe range for your gate
 
 # ---- sweep definition ----
-VG_VALUES = np.linspace(0.0, 0.0, 1)   # slow axis (top gate) values -- placeholder, single point
+VG_VALUES = np.linspace(0.0, 0.001, 10)   # slow axis (top gate) values -- placeholder, single point
 VDC_MIN = -2.6                          # V, fast axis (bottom gate) sweep start
 VDC_MAX = -2.8                          # V, fast axis (bottom gate) sweep end
-VDNSTEP = 20                             # number of fast-axis points per line
+VDNSTEP = 100                             # number of fast-axis points per line
 
 # ---- timing (all derived from TCLOCKIN by default -- override directly if needed) ----
-TSL = 15 * TCLOCKIN     # dwell time per fast-axis point
+TSL = 30e-3     # dwell time per fast-axis point
 T_SKIP = 3 * TCLOCKIN   # settle time after each step before trusting the lock-in output
 TWAIT = 10 * TCLOCKIN   # settle time after moving the slow axis, before a fast-axis line
 
@@ -77,10 +77,27 @@ SAMPLES_PER_TCLOCKIN = 5   # independent-ish samples per lock-in time constant
 
 # ---- calibration settings ----
 CALIB_N_POINTS = 5             # number of calibration steps (spans VDC_MIN to VDC_MAX)
-CALIB_SETTLE_TIME = 1.0        # s, wait after each calibration step -- must comfortably
-                                # exceed the real device's settling time (check the fitted
-                                # tau values and widen this if fits look poor / inconsistent)
-CALIB_N_OVERSAMPLE = 50         # buffer samples per calibration step
+
+# CALIB_SETTLE_TIME scales with TCLOCKIN (not a fixed absolute value) for the
+# same reason TSL/T_SKIP/TWAIT do: a fixed 1.0s settle_time combined with a
+# capture rate that scales as 1/TCLOCKIN means the required buffer size
+# (~ rate * duration) scales as 1/TCLOCKIN too -- shrink TCLOCKIN enough and
+# the calibration buffer blows past the instrument's 4096 kB hardware limit
+# (this happened: 14650 kB requested at TCLOCKIN small enough). Scaling
+# settle_time WITH TCLOCKIN makes rate*duration -- and therefore the
+# required buffer size -- independent of TCLOCKIN entirely, so this can't
+# recur regardless of how TCLOCKIN is tuned later.
+CALIB_SETTLE_TIME = 300 * TCLOCKIN   # s, wait after each calibration step -- must
+                                       # comfortably exceed the real device's settling
+                                       # time (check fitted tau values; widen the 300x
+                                       # multiplier if fits look poor/inconsistent)
+
+# Calibration's capture rate must resolve the TRANSIENT itself, not just fit
+# "enough total samples" into the settle_time window -- tying rate to
+# TCLOCKIN (like the main sweep's SAMPLES_PER_TCLOCKIN) keeps sampling dense
+# regardless of settle_time.
+CALIB_SAMPLES_PER_TCLOCKIN = 50   # denser than the main sweep's 5, since a clean
+                                   # fit needs good resolution ON the transient itself
 
 # ---- experiment / database ----
 USER = 'AA'
@@ -177,8 +194,10 @@ def calibrate_capture_offset(buf, step_fn, calib_voltages, settle_time, plot=Tru
 	# from the main sweep's rate (based on TSL) -- otherwise a long TSL/low
 	# main-sweep rate would starve the calibration windows of samples.
 	original_capture_rate = buf.capture_rate()
-	target_calib_rate = CALIB_N_OVERSAMPLE / settle_time
+	target_calib_rate = CALIB_SAMPLES_PER_TCLOCKIN / TCLOCKIN
 	buf.capture_rate(target_calib_rate)
+	print(f'Calibration capture rate: {buf.capture_rate():.1f} Hz '
+		  f'(requested {target_calib_rate:.1f}, {CALIB_SAMPLES_PER_TCLOCKIN} samples/TCLOCKIN)')
 
 	calib_duration = len(calib_voltages) * settle_time
 	calib_samples_needed = int(np.ceil(buf.capture_rate() * calib_duration * 2.0))
@@ -260,7 +279,7 @@ def calibrate_capture_offset(buf, step_fn, calib_voltages, settle_time, plot=Tru
 		good_iter = iter(good)
 		for ax, info in zip(axes[:, 0], fit_info):
 			t_rel = info['t_win'] - info['t_cmd']
-			ax.plot(t_rel * 1e3, info['y_win'], '.', ms=3, color='tab:gray', label='data')
+			ax.plot(t_rel * 1e3, info['y_win'], '.-', ms=4, lw=0.5, color='tab:gray', label='data')
 			if info['success']:
 				t0, tau, A, B = info['popt']
 				t_fit = np.linspace(info['t_win'][0], info['t_win'][-1], 300)
@@ -272,9 +291,18 @@ def calibrate_capture_offset(buf, step_fn, calib_voltages, settle_time, plot=Tru
 				ax.set_title(f"step {info['k']}  (gate = {info['v']:.4f} V): "
 							  f"offset = {(t0 - info['t_cmd'])*1e3:.2f} ms  [{status}]",
 							  fontsize=9)
+				t0_rel_ms = (t0 - info['t_cmd']) * 1e3
+				zoom_half_width_ms = max(6 * tau, 5 * TCLOCKIN) * 1e3
+				xlo, xhi = t0_rel_ms - 0.3 * zoom_half_width_ms, t0_rel_ms + zoom_half_width_ms
+				ax.set_xlim(xlo, xhi)
+				n_points_in_view = np.sum((t_rel * 1e3 >= xlo) & (t_rel * 1e3 <= xhi))
+				print(f'  step {info["k"]}: {len(t_rel)} points in full fit window, '
+					  f'{n_points_in_view} points in zoomed view')
 			else:
 				ax.set_title(f"step {info['k']}  (gate = {info['v']:.4f} V): fit failed",
 							  fontsize=9, color='tab:red')
+				fallback_half_width_ms = 50 * TCLOCKIN * 1e3
+				ax.set_xlim(-0.3 * fallback_half_width_ms, fallback_half_width_ms)
 			ax.set_xlabel('time relative to t_cmd (ms)')
 			ax.set_ylabel('X (V)')
 			ax.legend(fontsize=7, loc='best')
